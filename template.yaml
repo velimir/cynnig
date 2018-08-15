@@ -1,0 +1,227 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+    cynnig
+
+    Motion detection notifications
+
+
+Parameters:
+  RocketServerURL:
+    Type: String
+
+  RocketUsername:
+    Type: String
+
+  RocketPassword:
+    Type: String
+    NoEcho: true
+
+  RocketRoomId:
+    Type: String
+
+  KMSKeyId:
+    Type: String
+
+# More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
+Globals:
+  Function:
+    Timeout: 5
+    MemorySize: 128
+
+
+Resources:
+
+  MotionEventsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-motion-events'
+      Tags:
+        - Key: AppName
+          Value: cynnig
+
+  MakeGIFFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: cynnig/build/
+      Handler: app.new_motion_video_handler
+      Runtime: python3.6
+      Policies:
+        Statement:
+          - Effect: Allow
+            Action:
+              - elastictranscoder:CreateJob
+              - elastictranscoder:ListPipelines
+            Resource: "*"
+      Environment:
+        Variables:
+          STACK_NAME: !Ref AWS::StackName
+      Tags:
+        AppName: cynnig
+      Events:
+        MotionEvents:
+          Type: S3
+          Properties:
+            Bucket: !Ref MotionEventsBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .mkv
+
+  MotionGIFsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-motion-gifs'
+      Tags:
+        - Key: AppName
+          Value: cynnig
+
+  MotionTranscoderNotificationsSNS:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-transcoder-notifications'
+      DisplayName: motion elastic transcoder events
+
+  ElasticTranscoderPipelineCFNFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: cynnig/build/
+      Handler: app.elastictranscoder_resource_handler
+      Runtime: python3.6
+      Timeout: 10
+      Policies:
+        Statement:
+          - Effect: Allow
+            Action:
+              - elastictranscoder:CreatePipeline
+              - elastictranscoder:UpdatePipeline
+              - elastictranscoder:DeletePipeline
+              - elastictranscoder:ReadPipeline
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - iam:PassRole
+            Resource: !GetAtt VideoPipelineRole.Arn
+      Tags:
+        AppName: cynnig
+
+  VideoPipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - elastictranscoder.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${AWS::StackName}-pipeline-policy'
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:Get*"
+                  - "s3:ListBucket"
+                Resource:
+                  - !Sub 'arn:aws:s3:::${AWS::StackName}-motion-events'
+                  - !Sub 'arn:aws:s3:::${AWS::StackName}-motion-events/*'
+                  - !Sub 'arn:aws:s3:::${AWS::StackName}-motion-gifs'
+                  - !Sub 'arn:aws:s3:::${AWS::StackName}-motion-gifs/*'
+              - Effect: Allow
+                Action:
+                  - "s3:Put*"
+                  - "s3:*MultipartUpload*"
+                Resource:
+                  - !Sub 'arn:aws:s3:::${AWS::StackName}-motion-gifs/*'
+              - Effect: Allow
+                Action:
+                  - "sns:Publish"
+                Resource: !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}-transcoder-notifications'
+              - Effect: Deny
+                Action:
+                  - "s3:*Delete*"
+                  - "s3:*Policy*"
+                  - "sns:*Remove*"
+                  - "sns:*Delete*"
+                  - "sns:*Permission*"
+                Resource: "*"
+
+  VideoPipeline:
+    Type: Custom::ElasticTranscoderPipeline
+    DependsOn:
+      - MotionEventsBucket
+      - MotionGIFsBucket
+    Properties:
+      ServiceToken: !GetAtt ElasticTranscoderPipelineCFNFunction.Arn
+      DisplayName: !Sub "${AWS::StackName} motion pipeline"
+      Role: !GetAtt VideoPipelineRole.Arn
+      InputBucket: !Sub '${AWS::StackName}-motion-events'
+      OutputBucket: !Sub '${AWS::StackName}-motion-gifs'
+      Notifications: !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}-transcoder-notifications'
+
+  MotionTranscoderNotificationHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: cynnig/build/
+      Handler: app.new_motion_gifs_handler
+      Runtime: python3.6
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Sub '${AWS::StackName}-motion-gifs'
+        - KMSDecryptPolicy:
+            KeyId: !Ref KMSKeyId
+      Tags:
+        AppName: cynnig
+      Environment:
+        Variables:
+          ROCKET_SERVER: !Ref RocketServerURL
+          ROCKET_USERNAME: !Ref RocketUsername
+          ROCKET_PASSWORD: !Ref RocketPassword
+          ROCKET_ROOM_ID: !Ref RocketRoomId
+          PIPELINE_BUCKET: !Sub '${AWS::StackName}-motion-gifs'
+      Events:
+        MotionTranscoderEvents:
+          Type: SNS
+          Properties:
+            Topic: !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}-transcoder-notifications'
+
+Outputs:
+
+  MotionEventsBucket:
+    Description: Bucket where all recording are posted
+    Value: !GetAtt MotionEventsBucket.Arn
+
+  MakeGIFFunction:
+    Description: Make GIF Lambda Function ARN
+    Value: !GetAtt MakeGIFFunction.Arn
+
+  MotionGIFsBucket:
+    Description: Bucket with GIF files
+    Value: !GetAtt MotionGIFsBucket.Arn
+
+  MotionTranscoderNotificationsSNS:
+    Description: |
+      SNS topic with notificaitons from elastic transcoder about new
+      GIF available
+    Value: !Ref MotionTranscoderNotificationsSNS
+
+  ElasticTranscoderPipelineCFNFunction:
+    Description: |
+      Lambda function which adds support for video pipelines as a AWS
+      custom resource
+    Value: !GetAtt ElasticTranscoderPipelineCFNFunction.Arn
+
+  VideoPipeline:
+    Description: video pipeline to transcode recordings to GIFS
+    Value: !GetAtt VideoPipeline.Arn
+
+  MotionTranscoderNotificationHandlerFunction:
+    Description: Lambda function that sends notifications with new GIFs
+    Value: !GetAtt MotionTranscoderNotificationHandlerFunction.Arn
