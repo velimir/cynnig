@@ -91,7 +91,6 @@ Resources:
       CodeUri: cynnig/build/
       Handler: app.elastictranscoder_resource_handler
       Runtime: python3.6
-      Timeout: 10
       Policies:
         Statement:
           - Effect: Allow
@@ -172,6 +171,7 @@ Resources:
       CodeUri: cynnig/build/
       Handler: app.new_motion_gifs_handler
       Runtime: python3.6
+      Timeout: 15
       Policies:
         - S3ReadPolicy:
             BucketName: !Sub '${AWS::StackName}-motion-gifs'
